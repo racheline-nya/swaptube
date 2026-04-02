@@ -1,4 +1,5 @@
-#include "../Scenes/Math/BeaverGridScene.h"
+#include "../Scenes/Math/Beavers/BeaverGridScene.h"
+#include "../Scenes/Math/Beavers/BeaverGridTNFScene.h"
 
 void bb52_progress() {
     BeaverGridScene bs(5, 2);
@@ -98,6 +99,29 @@ void bb23() {
     bs.render_microblock();
 }
 
+void bbTNF() {
+    BeaverGridTNFScene bs;
+    bs.manager.set("zoom", "-1");
+    bs.manager.set("max_steps", "400");
+    bs.manager.set("center_x", "e <zoom> -1 * ^ {t} sin * 2 * 0.80985 +");
+    bs.manager.set("center_y", "e <zoom> -1 * ^ {t} cos * 0.83564 +");
+    stage_macroblock(SilenceBlock(5), 7);
+    bs.manager.transition(MACRO, "zoom", "14");
+    bs.render_microblock();
+    bs.export_frame("bbTNF_1");
+    bs.render_microblock();
+    bs.export_frame("bbTNF_2");
+    bs.render_microblock();
+    bs.export_frame("bbTNF_3");
+    bs.render_microblock();
+    bs.export_frame("bbTNF_4");
+    bs.render_microblock();
+    bs.export_frame("bbTNF_5");
+    bs.render_microblock();
+    bs.export_frame("bbTNF_6");
+    bs.render_microblock();
+}
+
 void render_video() {
-    bb52();
+    bbTNF();
 }
