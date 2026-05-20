@@ -6,66 +6,127 @@
 #include <vector>
 
 const int half_tape_length = 20;
+const int maxt = -1;
 
-struct Path {
+struct RayState {
+    Cuda::vec3 raypos;
+    Cuda::vec3 raydir;
+    Cuda::vec4 raycol;
+    Cuda::vec4 cubcol;
+    float cubalpha2;
+    TuringMachine tm;
+    int max_steps;
+
     int action[CODON_MEM_LIMIT] = {0};
     int states[CODON_MEM_LIMIT] = {2};
     int symbols[CODON_MEM_LIMIT] = {2};
+    int haltcol[CODON_MEM_LIMIT];
     int pathlen = 0;
-};
 
-struct CuboidPath {
     Cuda::vec3 lower[2*CODON_MEM_LIMIT];
     Cuda::vec3 upper[2*CODON_MEM_LIMIT];
-    int pathlen = 0;
+    int cplen = 0;
+
+    int looppart;
+    int face_id;
+    Cuda::vec3 target;
+    Cuda::vec3 startpos;
+    float ray_thickness;
+    Cuda::vec3 scale;
+    float shell_border;
+    float core_border;
+    Cuda::vec3 highlight;
+    float highlight_intensity;
+
+    float ancestor_offset;
+
+    bool init;
+    int t;
+    bool skip = false;
+    bool print = false;
 };
 
-__device__ int raytrace_aligned(Cuda::vec3& raypos, Cuda::vec3 raydir, Cuda::vec3 lower_xyz, Cuda::vec3 upper_xyz, bool inside) {
+__device__ int raytrace_aligned(RayState& r, bool inside) {
     float dists[6] = {-1, -1, -1, -1, -1, -1};
     bool checkface[6] = {
-        raydir.x != 0 && ((raydir.x < 0) == inside),
-        raydir.x != 0 && ((raydir.x > 0) == inside),
-        raydir.y != 0 && ((raydir.y < 0) == inside),
-        raydir.y != 0 && ((raydir.y > 0) == inside),
-        raydir.z != 0 && ((raydir.z < 0) == inside),
-        raydir.z != 0 && ((raydir.z > 0) == inside)
+        r.raydir.x != 0 && ((r.raydir.x < 0) == inside),
+        r.raydir.x != 0 && ((r.raydir.x > 0) == inside),
+        r.raydir.y != 0 && ((r.raydir.y < 0) == inside),
+        r.raydir.y != 0 && ((r.raydir.y > 0) == inside),
+        r.raydir.z != 0 && ((r.raydir.z < 0) == inside),
+        r.raydir.z != 0 && ((r.raydir.z > 0) == inside)
     };
-    if (checkface[0]) dists[0] = (lower_xyz.x - raypos.x) / raydir.x;
-    if (checkface[1]) dists[1] = (upper_xyz.x - raypos.x) / raydir.x;
-    if (checkface[2]) dists[2] = (lower_xyz.y - raypos.y) / raydir.y;
-    if (checkface[3]) dists[3] = (upper_xyz.y - raypos.y) / raydir.y;
-    if (checkface[4]) dists[4] = (lower_xyz.z - raypos.z) / raydir.z;
-    if (checkface[5]) dists[5] = (upper_xyz.z - raypos.z) / raydir.z;
+    if (checkface[0]) dists[0] = (r.lower[r.cplen - 1].x - r.raypos.x) / r.raydir.x;
+    if (checkface[1]) dists[1] = (r.upper[r.cplen - 1].x - r.raypos.x) / r.raydir.x;
+    if (checkface[2]) dists[2] = (r.lower[r.cplen - 1].y - r.raypos.y) / r.raydir.y;
+    if (checkface[3]) dists[3] = (r.upper[r.cplen - 1].y - r.raypos.y) / r.raydir.y;
+    if (checkface[4]) dists[4] = (r.lower[r.cplen - 1].z - r.raypos.z) / r.raydir.z;
+    if (checkface[5]) dists[5] = (r.upper[r.cplen - 1].z - r.raypos.z) / r.raydir.z;
     float dist = -1;
-    int face_id = -1;
+    r.face_id = -1;
     for (int i=0; i<6; i++) {
         int axis = i / 2;
-        Cuda::vec3 newpos = raypos + dists[i] * raydir;
-        if (dists[i] >= 0 && ((newpos.x >= lower_xyz.x && newpos.x <= upper_xyz.x) || axis == 0) && ((newpos.y >= lower_xyz.y && newpos.y <= upper_xyz.y) || axis == 1) && ((newpos.z >= lower_xyz.z && newpos.z <= upper_xyz.z) || axis == 2)) {
+        Cuda::vec3 newpos = r.raypos + dists[i] * r.raydir;
+        if (dists[i] >= 0 && ((newpos.x >= r.lower[r.cplen - 1].x && newpos.x <= r.upper[r.cplen - 1].x) || axis == 0) && ((newpos.y >= r.lower[r.cplen - 1].y && newpos.y <= r.upper[r.cplen - 1].y) || axis == 1) && ((newpos.z >= r.lower[r.cplen - 1].z && newpos.z <= r.upper[r.cplen - 1].z) || axis == 2)) {
             dist = dists[i];
-            face_id = i;
+            r.face_id = i;
+	    break;
         }
     }
-    if (face_id != -1) {
-        raypos += dist * raydir;
+    if (r.face_id != -1) {
+        r.raypos += dist * r.raydir;
     }
-    return face_id;
+    Cuda::vec3 thingy = (r.raypos - (r.lower[r.cplen - 1] + r.upper[r.cplen - 1]) / 2) / (r.upper[r.cplen - 1] - r.lower[r.cplen - 1]);
+    r.cubalpha2 = 2 * (thingy.x * thingy.x + thingy.y * thingy.y + thingy.z * thingy.z - 0.25);
 }
 
-__device__ void add_color_layer(Cuda::vec3 raypos, Cuda::vec4& raycol, Cuda::vec4 cubcol, Cuda::vec3 lower_xyz, Cuda::vec3 upper_xyz, int face_id, Cuda::vec3 target) {
-    int axis = face_id / 2;
-    float c = (lower_xyz.x <= target.x && target.x <= upper_xyz.x && lower_xyz.y <= target.y && target.y <= upper_xyz.y && lower_xyz.z <= target.z && target.z <= upper_xyz.z) ? 1 : 0.05;
-    float front_opacity = raycol.x;
-    float back_opacity = cubcol.x * c;
+__device__ void add_color_layer(RayState& r) {
+    r.cubcol = Cuda::vec4(((r.haltcol[r.pathlen - 1] >> 24) & 0x000000ff) / 255.0f, ((r.haltcol[r.pathlen - 1] >> 16) & 0x000000ff) / 255.0f, ((r.haltcol[r.pathlen - 1] >> 8) & 0x000000ff) / 255.0f, (r.haltcol[r.pathlen - 1] & 0x000000ff) / 255.0f);
+
+    int ca = 0;
+    int nonca = r.cplen / 2;
+    while (nonca > ca + 1) {
+        int cid = (ca + nonca) / 2;
+        bool targeted = (
+            r.lower[2 * cid].x < r.target.x && r.target.x < r.upper[2 * cid].x &&
+            r.lower[2 * cid].y < r.target.y && r.target.y < r.upper[2 * cid].y &&
+            r.lower[2 * cid].z < r.target.z && r.target.z < r.upper[2 * cid].z
+        );
+        ca += (int)(targeted) * (cid - ca);
+        nonca -= (int)(!targeted) * (nonca - cid);
+    }
+    float fractionca = nonca;
+    if (nonca < r.cplen / 2) {
+        Cuda::vec3 dists = Cuda::vec3(
+            fmaxf(0.0f, fmaxf(r.lower[2 * nonca].x - r.target.x, r.target.x - r.upper[2 * nonca].x)),
+            fmaxf(0.0f, fmaxf(r.lower[2 * nonca].y - r.target.y, r.target.y - r.upper[2 * nonca].y)),
+            fmaxf(0.0f, fmaxf(r.lower[2 * nonca].z - r.target.z, r.target.z - r.upper[2 * nonca].z))
+        );
+        float distnonca = sqrtf(dists.x * dists.x + dists.y * dists.y + dists.z * dists.z);
+        dists = Cuda::vec3(
+            fmaxf(r.lower[2 * ca].x - r.target.x, r.target.x - r.upper[2 * ca].x),
+            fmaxf(r.lower[2 * ca].y - r.target.y, r.target.y - r.upper[2 * ca].y),
+            fmaxf(r.lower[2 * ca].z - r.target.z, r.target.z - r.upper[2 * ca].z)
+        );
+        float distca = sqrtf(dists.x * dists.x + dists.y * dists.y + dists.z * dists.z);
+        fractionca += distca / (distca + distnonca);
+    }
+
+    float front_opacity = r.raycol.x;
+
+    float depth_offset = 1.3f + r.cplen / 2 - fractionca;
+    float c = atanf((fractionca - r.ancestor_offset - depth_offset * depth_offset) / 4.) / 1.57079632679f + 1;
+    if (c < 0.01f && r.looppart == 4) r.skip = true;
+    float back_opacity = r.cubcol.x * r.cubalpha2 * c * 0.5 /* (0.3f + (int)(nonca == r.cplen / 2))*/;
+
     float total_opacity = 1 - (1 - front_opacity) * (1 - back_opacity);
     float front_weight = front_opacity / total_opacity;
-    Cuda::vec3 facecol = Cuda::vec3(axis == 0 ? 1 : 0, axis == 1 ? 1 : 0, axis == 2 ? 1 : 0);
-    Cuda::vec3 rgb_lerp = front_weight * Cuda::vec3(raycol.y, raycol.z, raycol.w) + (1 - front_weight) * Cuda::vec3(cubcol.y, cubcol.z, cubcol.w) * facecol;
-    raycol = Cuda::vec4(total_opacity, rgb_lerp.x, rgb_lerp.y, rgb_lerp.z);
+    Cuda::vec3 rgb_lerp = front_weight * Cuda::vec3(r.raycol.y, r.raycol.z, r.raycol.w) + (1 - front_weight) * Cuda::vec3(r.cubcol.y, r.cubcol.z, r.cubcol.w);
+    r.raycol = Cuda::vec4(total_opacity, rgb_lerp.x, rgb_lerp.y, rgb_lerp.z);
 }
 
-__device__ void get_child_3d(TuringMachine& tm, int action_index, const Cuda::vec3& raypos, Cuda::vec3& lower_xyz, Cuda::vec3& upper_xyz) {
-    Cuda::vec3 child_size = (upper_xyz - lower_xyz) / Cuda::vec3(tm.num_states, tm.num_symbols, 2);
+__device__ void get_child_3d(RayState& r) {
+    Cuda::vec3 child_size = (r.upper[r.cplen - 1] - r.lower[r.cplen - 1]) / Cuda::vec3(r.tm.num_states, r.tm.num_symbols, 2);
 
     /* ivecs don't exist yet and some things need to be changed anyway
     Cuda::ivec3 child_pos = floor((raypos - lower_xyz) / child_size);
@@ -78,16 +139,25 @@ __device__ void get_child_3d(TuringMachine& tm, int action_index, const Cuda::ve
     tm.num_states += (int)(tm.next_state[action_index] == tm.num_states-1);
     */
 
-    int child_x = min(tm.num_states-1, max(0, (int)(floor((raypos.x - lower_xyz.x) / child_size.x))));
-    int child_y = min(tm.num_symbols-1, max(0, (int)(floor((raypos.y - lower_xyz.y) / child_size.y))));
-    int child_z = min(1, max(0, (int)(floor((raypos.z - lower_xyz.z) / child_size.z))));
-    lower_xyz += child_size * Cuda::vec3(child_x, child_y, child_z);
-    upper_xyz = lower_xyz + child_size;
-    tm.left_right[action_index] = (bool)(child_z);
-    tm.write_symbol[action_index] = child_y;
-    tm.next_state[action_index] = child_x;
-    tm.num_symbols += (int)(tm.write_symbol[action_index] == tm.num_symbols-1);
-    tm.num_states += (int)(tm.next_state[action_index] == tm.num_states-1);
+    int child_x = min(r.tm.num_states-1, max(0, (int)(floor((r.raypos.x - r.lower[r.cplen - 1].x) / child_size.x))));
+    int child_y = min(r.tm.num_symbols-1, max(0, (int)(floor((r.raypos.y - r.lower[r.cplen - 1].y) / child_size.y))));
+    int child_z = min(1, max(0, (int)(floor((r.raypos.z - r.lower[r.cplen - 1].z) / child_size.z))));
+    r.lower[r.cplen - 1] += child_size * Cuda::vec3(child_x, child_y, child_z);
+    r.upper[r.cplen - 1] = r.lower[r.cplen - 1] + child_size;
+    r.tm.left_right[r.action[r.pathlen - 1]] = (bool)(child_z);
+    r.tm.write_symbol[r.action[r.pathlen - 1]] = child_y;
+    r.tm.next_state[r.action[r.pathlen - 1]] = child_x;
+    r.tm.num_symbols += (int)(r.tm.write_symbol[r.action[r.pathlen - 1]] == r.tm.num_symbols-1);
+    r.tm.num_states += (int)(r.tm.next_state[r.action[r.pathlen - 1]] == r.tm.num_states-1);
+}
+
+__device__ void print_everything(RayState& r) {
+    printf("Looppart: %d    Pos: (%f,%f,%f)    Cuboid: ((%f,%f,%f),(%f,%f,%f))    Color: (%f,%f,%f,%f)\n",
+        r.looppart,
+        r.raypos.x / r.scale.x, r.raypos.y / r.scale.y, r.raypos.z / r.scale.z,
+        r.lower[r.cplen - 1].x / r.scale.x, r.lower[r.cplen - 1].y / r.scale.y, r.lower[r.cplen - 1].z / r.scale.z, r.upper[r.cplen - 1].x / r.scale.x, r.upper[r.cplen - 1].y / r.scale.y, r.upper[r.cplen - 1].z / r.scale.z,
+        r.raycol.x, r.raycol.y, r.raycol.z, r.raycol.w
+    );
 }
 
 
@@ -130,62 +200,79 @@ in 5., we remove the last transition from path and undefine it in the tm, and re
 
 
 
-__device__ void loop1(Cuda::vec3& raypos, Cuda::vec3 raydir, Cuda::vec4& raycol, Cuda::vec4& cubcol, TuringMachine& tm, int max_steps, Path& p, CuboidPath& cp, int& looppart, int& face_id, Cuda::vec3 target) {
-    face_id = raytrace_aligned(raypos, raydir, cp.lower[cp.pathlen - 1], cp.upper[cp.pathlen - 1], true);
+__device__ void loop1(RayState& r) {
+    if (r.print) print_everything(r);
 
-    if (face_id == 0) tm.next_state[p.action[p.pathlen - 1]]--;
-    if (face_id == 1) tm.next_state[p.action[p.pathlen - 1]]++;
-    if (face_id == 2) tm.write_symbol[p.action[p.pathlen - 1]]--;
-    if (face_id == 3) tm.write_symbol[p.action[p.pathlen - 1]]++;
-    bool should_leave_core = (tm.next_state[p.action[p.pathlen - 1]] < 0 || tm.next_state[p.action[p.pathlen - 1]] >= p.states[p.pathlen - 1] || tm.write_symbol[p.action[p.pathlen - 1]] < 0 || tm.write_symbol[p.action[p.pathlen - 1]] >= p.symbols[p.pathlen - 1]);
-    if (face_id >= 4) {
-        should_leave_core = (tm.left_right[p.action[p.pathlen - 1]] == (face_id == 5));
-        tm.left_right[p.action[p.pathlen - 1]] = !tm.left_right[p.action[p.pathlen - 1]];
+    raytrace_aligned(r, true);
+    if (r.print && r.face_id == -1) printf("missed\n");
+
+    if (r.face_id == 0) r.tm.next_state[r.action[r.pathlen - 1]]--;
+    if (r.face_id == 1) r.tm.next_state[r.action[r.pathlen - 1]]++;
+    if (r.face_id == 2) r.tm.write_symbol[r.action[r.pathlen - 1]]--;
+    if (r.face_id == 3) r.tm.write_symbol[r.action[r.pathlen - 1]]++;
+    bool should_leave_core = (r.tm.next_state[r.action[r.pathlen - 1]] < 0 || r.tm.next_state[r.action[r.pathlen - 1]] >= r.states[r.pathlen - 1] || r.tm.write_symbol[r.action[r.pathlen - 1]] < 0 || r.tm.write_symbol[r.action[r.pathlen - 1]] >= r.symbols[r.pathlen - 1]);
+    if (r.face_id >= 4) {
+        should_leave_core = (r.tm.left_right[r.action[r.pathlen - 1]] == (r.face_id == 5));
+        r.tm.left_right[r.action[r.pathlen - 1]] = !r.tm.left_right[r.action[r.pathlen - 1]];
     }
 
-    if (!should_leave_core) {
-        int axis = face_id / 2;
-        Cuda::vec3 diff = ((face_id & 1) * 2 - 1) * Cuda::vec3((int)(axis == 0), (int)(axis == 1), (int)(axis == 2)) * (cp.upper[cp.pathlen - 1] - cp.lower[cp.pathlen - 1]);
-        cp.lower[cp.pathlen - 1] += diff;
-        cp.upper[cp.pathlen - 1] += diff;
-	if (tm.next_state[p.action[p.pathlen - 1]] == tm.num_states - 1) tm.num_states++;
-	if (tm.write_symbol[p.action[p.pathlen - 1]] == tm.num_symbols - 1) tm.num_symbols++;
-        looppart = 2;
+    if (r.face_id != -1 && !should_leave_core) {
+        int axis = r.face_id / 2;
+        Cuda::vec3 diff = ((r.face_id & 1) * 2 - 1) * Cuda::vec3((int)(axis == 0), (int)(axis == 1), (int)(axis == 2)) * (r.upper[r.cplen - 1] - r.lower[r.cplen - 1]);
+        r.lower[r.cplen - 1] += diff;
+        r.upper[r.cplen - 1] += diff;
+	if (r.tm.next_state[r.action[r.pathlen - 1]] == r.tm.num_states - 1) r.tm.num_states++;
+	if (r.tm.write_symbol[r.action[r.pathlen - 1]] == r.tm.num_symbols - 1) r.tm.num_symbols++;
+        r.looppart = 2;
     } else {
-        cp.pathlen--;
-        looppart = 5;
+        r.cplen--;
+        r.looppart = 5;
     }
 }
 
-__device__ void loop2(Cuda::vec3& raypos, Cuda::vec3 raydir, Cuda::vec4& raycol, Cuda::vec4& cubcol, TuringMachine& tm, int max_steps, Path& p, CuboidPath& cp, int& looppart, int& face_id, Cuda::vec3 target, float shell_border, bool init = false) {
-    Cuda::vec3 border = shell_border * (cp.upper[cp.pathlen - 1] - cp.lower[cp.pathlen - 1]);
-    cp.lower[cp.pathlen] = cp.lower[cp.pathlen - 1] + border;
-    cp.upper[cp.pathlen] = cp.upper[cp.pathlen - 1] - border;
-    if (!init) {
-        face_id = raytrace_aligned(raypos, raydir, cp.lower[cp.pathlen], cp.upper[cp.pathlen], false);
+__device__ void loop2(RayState& r) {
+    if (r.print) print_everything(r);
+
+    Cuda::vec3 border = r.shell_border * (r.upper[r.cplen - 1] - r.lower[r.cplen - 1]);
+    r.lower[r.cplen] = r.lower[r.cplen - 1] + border;
+    r.upper[r.cplen] = r.upper[r.cplen - 1] - border;
+    if (!r.init) {
+        r.cplen++;
+        raytrace_aligned(r, false);
     } else {
-        if (!(raypos.x >= cp.lower[cp.pathlen].x && raypos.x <= cp.upper[cp.pathlen].x && raypos.y >= cp.lower[cp.pathlen].y && raypos.y <= cp.upper[cp.pathlen].y && raypos.z >= cp.lower[cp.pathlen].z && raypos.z <= cp.upper[cp.pathlen].z)) {
-            looppart = 0;
+        if (!(
+          r.raypos.x >= r.lower[r.cplen].x && r.raypos.x <= r.upper[r.cplen].x &&
+          r.raypos.y >= r.lower[r.cplen].y && r.raypos.y <= r.upper[r.cplen].y &&
+          r.raypos.z >= r.lower[r.cplen].z && r.raypos.z <= r.upper[r.cplen].z
+        )) {
+            r.looppart = 0;
             return;
         }
+        r.cplen++;
+        r.looppart = 3;
+        return;
     }
+    Cuda::vec3 curray = r.raypos - r.startpos;
+    Cuda::vec3 cubsize = r.upper[r.cplen - 1] - r.lower[r.cplen - 1];
 
-    if (face_id == -1) {
-        looppart = 1;
+    if (r.face_id == -1 || (cubsize.x + cubsize.y + cubsize.z) < 3 * r.ray_thickness * sqrtf(curray.x * curray.x + curray.y * curray.y + curray.z * curray.z)) {
+        r.cplen--;
+        r.looppart = 1;
     } else {
-        cp.pathlen++;
-        looppart = 3;
+        r.looppart = 3;
     }
 }
 
-__device__ void loop3(Cuda::vec3& raypos, Cuda::vec3 raydir, Cuda::vec4& raycol, Cuda::vec4& cubcol, TuringMachine& tm, int max_steps, Path& p, CuboidPath& cp, int& looppart, int& face_id, Cuda::vec3 target, bool init = false) {
+__device__ void loop3(RayState& r) {
+    if (r.print) print_everything(r);
+
     int tape[2 * half_tape_length + 1] = {0};
     int head_position = half_tape_length;
     int current_state = 0;
     int steps = 0;
     int action_index;
 
-    while (steps < max_steps) {
+    while (steps < r.max_steps) {
         // the transitions are indexed like this (but continued up to CODON_MEM_LIMIT-1):
         // 0  2  5  10
         // 1  3  7  12
@@ -198,12 +285,12 @@ __device__ void loop3(Cuda::vec3& raypos, Cuda::vec3 raydir, Cuda::vec4& raycol,
             break;
         }
 
-        current_state = tm.next_state[action_index];
+        current_state = r.tm.next_state[action_index];
         if(current_state == -1) {
             break;
         }
-        tape[head_position] = tm.write_symbol[action_index];
-        head_position += tm.left_right[action_index] ? 1 : -1;
+        tape[head_position] = r.tm.write_symbol[action_index];
+        head_position += r.tm.left_right[action_index] ? 1 : -1;
         if (head_position < 0 || head_position > 2 * half_tape_length) {
             break;
         }
@@ -211,123 +298,207 @@ __device__ void loop3(Cuda::vec3& raypos, Cuda::vec3 raydir, Cuda::vec4& raycol,
         steps++;
     }
     bool halted = current_state == -1;
+
+    r.skip = !halted && (
+      r.highlight.x >= r.lower[r.cplen - 1].x && r.highlight.x <= r.upper[r.cplen - 1].x &&
+      r.highlight.y >= r.lower[r.cplen - 1].y && r.highlight.y <= r.upper[r.cplen - 1].y &&
+      r.highlight.z >= r.lower[r.cplen - 1].z && r.highlight.z <= r.upper[r.cplen - 1].z
+    ); // using r.skip for highlighting, since they affect the flow of the program the same way
     
-    if (!halted) {
-        cp.pathlen--;
-        looppart = 1;
+    if (!(halted || r.skip)) {
+        r.cplen--;
+        r.looppart = 1;
     } else {
-        p.action[p.pathlen] = action_index;
-        p.states[p.pathlen] = tm.num_states;
-        p.symbols[p.pathlen] = tm.num_symbols;
-        p.pathlen++;
-        looppart = 4;
+        r.haltcol[r.pathlen] = d_rainbow(atan(steps / 4.0) / 1.57079632679f) - 0xd0000000;
+        r.haltcol[r.pathlen] += (int)(r.skip) * (0x00ffffff - r.haltcol[r.pathlen] + ((int)(floor(r.highlight_intensity * 255.99)) << 24));
+        //r.cubcol = Cuda::vec4(((r.haltcol[r.pathlen] >> 24) & 0x000000ff) / 255.0f, ((r.haltcol[r.pathlen] >> 16) & 0x000000ff) / 255.0f, ((r.haltcol[r.pathlen] >> 8) & 0x000000ff) / 255.0f, (r.haltcol[r.pathlen] & 0x000000ff) / 255.0f);
+        r.action[r.pathlen] = action_index + (int)(r.skip)*(CODON_MEM_LIMIT - action_index - 1);
+        r.states[r.pathlen] = r.tm.num_states;
+        r.symbols[r.pathlen] = r.tm.num_symbols;
+        r.pathlen++;
+        r.looppart = 4;
+        r.skip = false;
     }
 }
 
-__device__ void loop4(Cuda::vec3& raypos, Cuda::vec3 raydir, Cuda::vec4& raycol, Cuda::vec4& cubcol, TuringMachine& tm, int max_steps, Path& p, CuboidPath& cp, int& looppart, int& face_id, Cuda::vec3 target, float core_border, bool init = false) {
-    Cuda::vec3 border = (cp.upper[cp.pathlen - 1] - cp.lower[cp.pathlen - 1]) * core_border;
-    cp.lower[cp.pathlen] = cp.lower[cp.pathlen - 1] + border;
-    cp.upper[cp.pathlen] = cp.upper[cp.pathlen - 1] - border;
-    if (!init) {
-        add_color_layer(raypos, raycol, cubcol, cp.lower[cp.pathlen - 1], cp.upper[cp.pathlen - 1], face_id, target);
-        face_id = raytrace_aligned(raypos, raydir, cp.lower[cp.pathlen], cp.upper[cp.pathlen], false);
+__device__ void loop4(RayState& r) {
+    if (r.print) print_everything(r);
+
+    Cuda::vec3 border = (r.upper[r.cplen - 1] - r.lower[r.cplen - 1]) * r.core_border;
+    r.lower[r.cplen] = r.lower[r.cplen - 1] + border;
+    r.upper[r.cplen] = r.upper[r.cplen - 1] - border;
+    if (!r.init) {
+        add_color_layer(r);
+        r.cplen++;
+        raytrace_aligned(r, false);
     } else {
-        if (!(raypos.x >= cp.lower[cp.pathlen].x && raypos.x <= cp.upper[cp.pathlen].x && raypos.y >= cp.lower[cp.pathlen].y && raypos.y <= cp.upper[cp.pathlen].y && raypos.z >= cp.lower[cp.pathlen].z && raypos.z <= cp.upper[cp.pathlen].z)) {
-            looppart = -2;
+        if (r.skip || !(
+          r.raypos.x >= r.lower[r.cplen].x && r.raypos.x <= r.upper[r.cplen].x &&
+          r.raypos.y >= r.lower[r.cplen].y && r.raypos.y <= r.upper[r.cplen].y &&
+          r.raypos.z >= r.lower[r.cplen].z && r.raypos.z <= r.upper[r.cplen].z
+        )) {
+            r.looppart = -2;
             return;
         }
+        r.cplen++;
     }
 
-    if (face_id == -1) {
-        looppart = 5;
+    if (r.face_id == -1 || r.skip) {
+        r.skip = false;
+        r.cplen--;
+        r.looppart = 5;
     } else {
-        cp.pathlen++;
-        get_child_3d(tm, p.action[p.pathlen - 1], raypos, cp.lower[cp.pathlen - 1], cp.upper[cp.pathlen - 1]);
-        looppart = 2;
+        get_child_3d(r);
+        r.looppart = 2;
     }
 }
 
-__device__ void loop5(Cuda::vec3& raypos, Cuda::vec3 raydir, Cuda::vec4& raycol, Cuda::vec4& cubcol, TuringMachine& tm, int max_steps, Path& p, CuboidPath& cp, int& looppart, int& face_id, Cuda::vec3 target) {
-    face_id = raytrace_aligned(raypos, raydir, cp.lower[cp.pathlen - 1], cp.upper[cp.pathlen - 1], true);
-    add_color_layer(raypos, raycol, cubcol, cp.lower[cp.pathlen - 1], cp.upper[cp.pathlen - 1], face_id, target);
-    p.pathlen--;
-    tm.write_symbol[p.action[p.pathlen]] = 1;
-    tm.left_right[p.action[p.pathlen]] = true;
-    tm.next_state[p.action[p.pathlen]] = -1;
-    tm.num_states = p.states[p.pathlen];
-    tm.num_symbols = p.symbols[p.pathlen];
-    cp.pathlen--;
-    if (cp.pathlen > 0) {
-        looppart = 1;
+__device__ void loop5(RayState& r) {
+    if (r.print) print_everything(r);
+
+    raytrace_aligned(r, true);
+    add_color_layer(r);
+    r.pathlen--;
+    r.tm.write_symbol[r.action[r.pathlen]] = 1;
+    r.tm.left_right[r.action[r.pathlen]] = true;
+    r.tm.next_state[r.action[r.pathlen]] = -1;
+    r.tm.num_states = r.states[r.pathlen];
+    r.tm.num_symbols = r.symbols[r.pathlen];
+    r.cplen--;
+    if (r.cplen > 0) {
+        r.looppart = 1;
     } else {
-        looppart = 0;
+        r.looppart = 0;
     }
 }
 
 
 
-__global__ void beaver_raytrace_kernel(unsigned int* pixels, int w, int h, Cuda::vec3 raypos, Cuda::quat camera, float fov, int max_steps, float shell_border, float core_border, Cuda::vec3 scale, Cuda::vec3 target) {
+__global__ void beaver_raytrace_kernel(unsigned int* pixels, int w, int h, Cuda::vec2 center, Cuda::vec3 raypos, Cuda::quat camera, float fov, int max_steps, float shell_border, float core_border, Cuda::vec3 scale, Cuda::vec3 target, float ancestor_offset, Cuda::vec3 highlight, float highlight_intensity) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int idy = blockIdx.y * blockDim.y + threadIdx.y;
     if (idx >= w || idy >= h) {
         return;
     }
     int pixel_index = idy * w + idx;
+    int pos_x = floor(idx + (0.5f - center.x) * w);
+    int pos_y = floor(idy + (0.5f - center.y) * h);
 
-    Cuda::vec3 raydir = Cuda::get_raymarch_vector(idx, idy, w, h, fov, camera);
-    Cuda::vec4 raycol = Cuda::vec4(0);
-    Cuda::vec4 cubcol = Cuda::vec4(0.1, 1, 1, 1);
+    RayState r;
+    //r.print = (idx == w / 2) && (idy == h / 2);
+    //r.print = (idx == 80) && (idy == 20);
+    //r.print = (idx == 358) && (idy == 178);
 
-    TuringMachine tm;
-    tm.num_states = 2;
-    tm.num_symbols = 2;
+    r.raypos = /*Cuda::vec3(0)*/ raypos;
+    r.startpos = /*Cuda::vec3(0)*/ raypos;
+    r.max_steps = max_steps;
+    r.target = /*target - raypos*/ Cuda::vec3(0);
+    r.scale = scale;
+    r.shell_border = shell_border;
+    r.core_border = core_border;
+    r.ancestor_offset = ancestor_offset;
+    r.highlight = highlight - /*raypos*/ target;
+    r.highlight_intensity = highlight_intensity;
+
+    r.raydir = Cuda::get_raymarch_vector(pos_x, pos_y, w, h, fov, camera);
+    Cuda::vec3 turn = Cuda::get_raymarch_vector(pos_x+1, pos_y, w, h, fov, camera) - r.raydir;
+    r.ray_thickness = sqrtf(turn.x * turn.x + turn.y * turn.y + turn.z * turn.z);
+    r.raycol = Cuda::vec4(0);
+    r.cubcol = Cuda::vec4(0.1, 1, 1, 1);
+
+    r.tm.num_states = 2;
+    r.tm.num_symbols = 2;
     for (int i=0; i<CODON_MEM_LIMIT; i++) {
-        tm.write_symbol[i] = 1;
-        tm.left_right[i] = true;
-        tm.next_state[i] = -1;
+        r.tm.write_symbol[i] = 1;
+        r.tm.left_right[i] = true;
+        r.tm.next_state[i] = -1;
     }
-    Path p;
-    CuboidPath cp;
-    cp.lower[0] = Cuda::vec3(0);
-    cp.upper[0] = scale;
-    cp.pathlen = 1;
+    r.lower[0] = /*-raypos*/ -target;
+    r.upper[0] = scale - /*raypos*/ target;
+    r.cplen = 1;
 
-    int looppart = 3;
-    bool init = true;
-    int face_id = -2;
-    if (raypos.x >= cp.lower[0].x && raypos.x <= cp.upper[0].x && raypos.y >= cp.lower[0].y && raypos.y <= cp.upper[0].y && raypos.z >= cp.lower[0].z && raypos.z <= cp.upper[0].z) {
-        while (looppart > 1) {
-            if (looppart == 2) loop2(raypos, raydir, raycol, cubcol, tm, max_steps, p, cp, looppart, face_id, target, shell_border, init);
-            if (looppart == 3) loop3(raypos, raydir, raycol, cubcol, tm, max_steps, p, cp, looppart, face_id, target, init);
-            if (looppart == 4) loop4(raypos, raydir, raycol, cubcol, tm, max_steps, p, cp, looppart, face_id, target, core_border, init);
+    r.looppart = 3;
+    r.init = true;
+    r.face_id = -2;
+
+    if (r.print) printf("\n");
+    //if (r.print) printf("Ray Position: (%f,%f,%f)\n", r.raypos.x / scale.x, r.raypos.y / scale.y, r.raypos.z / scale.z);
+
+    if (r.raypos.x >= r.lower[0].x && r.raypos.x <= r.upper[0].x && r.raypos.y >= r.lower[0].y && r.raypos.y <= r.upper[0].y && r.raypos.z >= r.lower[0].z && r.raypos.z <= r.upper[0].z) {
+        while (r.looppart > 1) {
+            if (r.looppart == 2) loop2(r);
+            if (r.looppart == 3) loop3(r);
+            if (r.looppart == 4) loop4(r);
         }
-        looppart = 2 - looppart;
+        r.looppart = 2 - r.looppart;
     } else {
-        face_id = raytrace_aligned(raypos, raydir, cp.lower[0], cp.upper[0], false);
-        looppart = 3;
+        raytrace_aligned(r, false);
+        r.looppart = 3;
     }
-    if (face_id != -1) {
-        int t = 0;
-        while (raycol.x < 0.998f && t < 50) {
-            if (looppart == 0) break;
-            if (looppart == 1) loop1(raypos, raydir, raycol, cubcol, tm, max_steps, p, cp, looppart, face_id, target);
-            if (looppart == 2) loop2(raypos, raydir, raycol, cubcol, tm, max_steps, p, cp, looppart, face_id, target, shell_border);
-            if (looppart == 3) loop3(raypos, raydir, raycol, cubcol, tm, max_steps, p, cp, looppart, face_id, target);
-            if (looppart == 4) loop4(raypos, raydir, raycol, cubcol, tm, max_steps, p, cp, looppart, face_id, target, core_border);
-            if (looppart == 5) loop5(raypos, raydir, raycol, cubcol, tm, max_steps, p, cp, looppart, face_id, target);
-            t++;
+    r.init = false;
+    if (r.print) printf("Init done!\n");
+    if (r.face_id != -1) {
+        r.t = 0;
+        while (r.raycol.x < 0.9f && r.t != maxt) {
+            if (r.looppart == 0) break;
+            if (r.looppart == 1) loop1(r);
+            if (r.looppart == 2) loop2(r);
+            if (r.looppart == 3) loop3(r);
+            if (r.looppart == 4) loop4(r);
+            if (r.looppart == 5) loop5(r);
+            r.t++;
         }
     }
-    pixels[pixel_index] = ((unsigned int)(floor(raycol.x * 255)) << 24) | ((unsigned int)(floor(raycol.y * 255)) << 16) | ((unsigned int)(floor(raycol.z * 255)) << 8) | (unsigned int)(floor(raycol.w * 255));
+    if (r.print) print_everything(r);
+
+    /*float front_opacity = r.raycol.x;
+    float back_opacity = 1;
+    float total_opacity = 1;
+    float front_weight = front_opacity;
+    Cuda::vec3 rgb_lerp = front_weight * Cuda::vec3(r.raycol.y, r.raycol.z, r.raycol.w) + (1 - front_weight) * Cuda::vec3(1);
+    r.raycol = Cuda::vec4(total_opacity, rgb_lerp.x, rgb_lerp.y, rgb_lerp.z);*/
+
+    pixels[pixel_index] = ((unsigned int)(floor(r.raycol.x * 255)) << 24) | ((unsigned int)(floor(r.raycol.y * 255)) << 16) | ((unsigned int)(floor(r.raycol.z * 255)) << 8) | (unsigned int)(floor(r.raycol.w * 255));
+    if (r.print) pixels[pixel_index] = 0xffff0000;
+    //if (r.t == maxt) pixels[pixel_index] = 0xffffffff;
+    //if (idx == 358 || idy == 178) pixels[pixel_index] = 0xffff00ff;
 }
 
+extern "C" void beaver_grid_TNF_3D_cuda(
+    unsigned int* pixels,
+    int w, int h, Cuda::vec2 center,
+    float dist, Cuda::quat camera, float fov, Cuda::vec3 target,
+    float shell_border, float core_border,
+    Cuda::vec3 scale, float ancestor_offset,
+    Cuda::vec3 highlight, float highlight_intensity,
+    int max_steps
+){
+    unsigned int* d_pixels;
+
+    cudaMalloc(&d_pixels, w * h * sizeof(unsigned int));
+    dim3 threads(16, 16);
+    dim3 block((w + threads.x - 1) / threads.x, (h + threads.y - 1) / threads.y);
+
+    //pos *= scale;
+    target *= scale;
+    highlight *= scale;
+    Cuda::vec3 pos = /*target +*/ dist * rotate_vector(Cuda::vec3(0, 0, -1), camera);
+
+    beaver_raytrace_kernel<<<block, threads>>>(d_pixels, w, h, center, pos, normalize(camera), fov, max_steps, shell_border, core_border, scale, target, ancestor_offset, highlight, highlight_intensity);
+
+    cudaMemcpy(pixels, d_pixels, w * h * sizeof(unsigned int), cudaMemcpyDeviceToHost);
+
+    cudaFree(d_pixels);
+}
+
+/*
 extern "C" void beaver_grid_TNF_3D_cuda(
     unsigned int* pixels,
     int w, int h,
     Cuda::vec3 pos, Cuda::quat camera, float fov,
     Cuda::vec3 target, Cuda::vec3 up, float use_quat_camera,
     float shell_border, float core_border,
-    Cuda::vec3 scale,
+    Cuda::vec3 scale, float ancestor_offset,
     int max_steps
 ){
     unsigned int* d_pixels;
@@ -342,9 +513,10 @@ extern "C" void beaver_grid_TNF_3D_cuda(
 
     camera = normalize(use_quat_camera * normalize(camera) + (1 - use_quat_camera) * Cuda::get_quat(forward, up));
 
-    beaver_raytrace_kernel<<<block, threads>>>(d_pixels, w, h, pos, camera, fov, max_steps, shell_border, core_border, scale, target);
+    beaver_raytrace_kernel<<<block, threads>>>(d_pixels, w, h, pos, camera, fov, max_steps, shell_border, core_border, scale, target, ancestor_offset);
 
     cudaMemcpy(pixels, d_pixels, w * h * sizeof(unsigned int), cudaMemcpyDeviceToHost);
 
     cudaFree(d_pixels);
 }
+*/
